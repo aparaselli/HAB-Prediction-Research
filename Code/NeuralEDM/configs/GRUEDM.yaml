@@ -1,0 +1,13 @@
+model: 'GRU'
+
+hidden_size: 100
+
+num_layers: 2
+
+epochs: 1000
+
+patience: 50
+
+saved_model_path: 'base_model.pth'
+
+fname: 'base_plot'
