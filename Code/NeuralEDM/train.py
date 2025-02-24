@@ -15,15 +15,15 @@ def l1_regularization(model, lambda_l1):
         l1_norm += param.abs().sum()
     return lambda_l1 * l1_norm
 
-def train(model, device, train_dataloader, val_dataloader, epochs=1000, patience=50):
-    optimizer = optim.Adam(model.parameters(),lr=0.00001)
+def train(model, device, train_dataloader, val_dataloader, epochs=10000, patience=50,save_m_path='model.pth'):
+    optimizer = optim.Adam(model.parameters(),lr=0.000005)
     criterion = torch.nn.MSELoss()
-    saved_model_path = 'model.pth'
+    saved_model_path = save_m_path
     scheduler = None
     train_loss_arr = []
     val_loss_arr = []
     best_val_loss = float('inf')
-    lambda_l1 = 0.9
+    lambda_l1 = 0.5
 
 
     for epoch in range(epochs):
@@ -57,6 +57,7 @@ def train(model, device, train_dataloader, val_dataloader, epochs=1000, patience
 
             if epoch%100 == 0:
                 print("Finish epoch {}, time elapsed {}".format(epoch, time.time() - ts))
+                print(f'Training loss at epoch {epoch}: {loss.item()}')
             if scheduler is not None:
                 scheduler.step()
             curr_val_loss = eval(model, device, val_dataloader, epoch)

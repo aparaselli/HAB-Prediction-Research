@@ -1,0 +1,13 @@
+model: 'Base'
+
+hidden_size: 100
+
+num_layers: 0
+
+epochs: 10000
+
+patience: 50
+
+saved_model_path: 'base_model.pth'
+
+fname: 'base_plot'

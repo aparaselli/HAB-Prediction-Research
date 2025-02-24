@@ -5,9 +5,11 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from torch.utils.data import random_split
+from config import *
 
 from utils import *
 from nn_edm import NNEDMModel
+from gru_nn import GRUEDMModel
 from HABs_dataset import HABsDataset
 from train import train, eval
 
@@ -24,32 +26,31 @@ def main():
 
     input_file_path = '../Data/cleaned_data.csv'
     target = 'Avg_Chloro'
+    config = load_config(args.config_file_path)
 
     print('ENCODED DATA')
-    '''
-    PAPER DATA
-    paper_data = pd.read_csv(input_file_path)
-    paper_data = paper_data.set_index('time (UTC)')
-    paper_data['Time'] = paper_data.index.astype(int)
-    paper_data = paper_data.drop(columns=['Time'])
-    '''
-    data = pd.read_csv('lorenz_with_extra_vars.csv')
-    data = data.drop(columns=['time','y'])
+    
+    #PAPER DATA
+    data = pd.read_csv(input_file_path)
+    data = data.set_index('time (UTC)')
+    data['Time'] = data.index.astype(int)
+    data = data.drop(columns=['Time'])
+
     tau_lengths = [-1,-2,-3]
     E = 6
-    target = 'x'
     X, y = get_data(data, E, tau_lengths, target=target) #returns numpy arrays 
+    print(len(X))
     embd_sz = len(data.columns) * E * len(tau_lengths)
 
     print('CREATED EMBEDDINGS')
 
     # Convert to PyTorch tensors
-    X_tensor = torch.tensor(X, dtype=torch.float)
-    y_tensor = torch.tensor(y, dtype=torch.float)
+    X_tensor = torch.tensor(X[:633], dtype=torch.float) #Train with 532 data points
+    y_tensor = torch.tensor(y[:633], dtype=torch.float)
 
     len_data = len(y_tensor)
 
-    train_frac, val_frac, test_frac = 0.5, 0.3, 0.2  
+    train_frac, val_frac, test_frac = 0.8, 0.2, 0.0
     train_size = int(train_frac * len_data)
     val_size = int(val_frac * len_data)
     test_size = len_data - train_size - val_size  
@@ -79,6 +80,7 @@ def main():
 
 
     train_dataset = HABsDataset(X_train, y_train)
+    #print(train_dataset.__getitem__(0))
     train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 
     val_dataset = HABsDataset(X_val, y_val)
@@ -90,8 +92,13 @@ def main():
 
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    model = NNEDMModel(embd_sz, hidden_size=100)
+    if config['model'] == 'Base':
+        model = NNEDMModel(embd_sz, hidden_size=config['hidden_size'])
+    elif config['model'] == 'GRU':
+        model = GRUEDMModel(embd_sz,hidden_size=config['hidden_size'],num_layers=config['num_layers'])
+    else:
+        print('INVALID MODEL SELECTED')
+        return
 
 
     #config = load_config(args.config_file_path)
@@ -100,11 +107,11 @@ def main():
     train(model=model,
             device=device,
             train_dataloader=train_dataloader,
-            val_dataloader=val_dataloader)
+            val_dataloader=val_dataloader,epochs=config['epochs'],patience=config['patience'],save_m_path=config['saved_model_path'])
 
     ## INFERENCE
     eval(model=model, device=device,
-    val_dataloader=test_dataloader)
+    val_dataloader=val_dataloader)
 
 
 if __name__ == '__main__':
