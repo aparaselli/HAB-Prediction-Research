@@ -79,19 +79,19 @@ def main():
 
 
     train_dataset = HABsDataset(X_train, y_train)
-    train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=128, shuffle=True)
 
     val_dataset = HABsDataset(X_val, y_val)
-    val_dataloader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+    val_dataloader = DataLoader(val_dataset, batch_size=128, shuffle=False)
 
     test_dataset = HABsDataset(X_test, y_test)
-    test_dataloader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    test_dataloader = DataLoader(test_dataset, batch_size=128, shuffle=False)
 
 
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    model = NNEDMModel(embd_sz, hidden_size=100)
+    model = NNEDMModel(embd_sz, hidden_size=1000)
 
 
     #config = load_config(args.config_file_path)

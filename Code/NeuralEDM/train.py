@@ -23,7 +23,7 @@ def train(model, device, train_dataloader, val_dataloader, epochs=1000, patience
     train_loss_arr = []
     val_loss_arr = []
     best_val_loss = float('inf')
-    lambda_l1 = 0.9
+    lambda_l1 = 0.05
 
 
     for epoch in range(epochs):
@@ -51,7 +51,6 @@ def train(model, device, train_dataloader, val_dataloader, epochs=1000, patience
                 # Backward pass and optimization
                 total_loss.backward()
                 
-
                 # update the weights
                 optimizer.step()
 
@@ -106,4 +105,4 @@ def eval(model, device, val_dataloader, epoch=None):
 
     model.train() #TURNING THE TRAIN MODE BACK ON TO ENABLE BATCHNORM/DROPOUT!!
 
-    return np.mean(losses)
+    return np.median(losses)
