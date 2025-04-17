@@ -211,6 +211,7 @@ def main():
     data = clean_data(config['data_path'])
     parameters = process_parameters(config['parameters_path'])
     forecast, num_models = next_forecast(data,parameters,config['target'],n=config['n'],p=config['p'])
+    #output to JSON
     print(f'Bloom prediction: {forecast[-1]}')
     print(f'Num of models which predict bloom: {num_models[-1]}')
 
