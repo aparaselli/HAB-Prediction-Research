@@ -144,7 +144,7 @@ target (string) - variable to forecast bloom of
 returns forecast for next time step given the dataframe, and number of models which predicted True
 '''
 
-def next_forecast(data,params,target,n=300,p=0.05,lib_off=-32):#data,params,target,lib,pred,ensemble_sz=300
+def next_forecast(data,params,target,n=300,p=0.05,lib_off=-2):#data,params,target,lib,pred,ensemble_sz=300
     lib = '1 ' + str(data.shape[0] + lib_off) 
     pred = '' + str(data.shape[0] + lib_off + 1) + ' ' + str(data.shape[0])
     parameters = create_model(data,params,target,lib,pred)
