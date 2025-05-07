@@ -1,0 +1,7 @@
+data_path: "../Data/carter_data_w_gaps.csv"
+parameters_path: "../Results/500_sample_carter_models.csv"
+target: "Avg_Chloro"
+bloom_thresh: 5.977
+samp: 3
+n: 1000
+p: 0.2
