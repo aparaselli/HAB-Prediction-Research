@@ -1,5 +1,7 @@
 data_path: "../Data/data_w_gaps_and_wind.csv"
 parameters_path: "../Results/100_sample_baseline_models.csv"
 target: "Avg_Chloro"
-n: 300
+bloom_thresh: 6.227
+samp: 2
+n: 800
 p: 0.05

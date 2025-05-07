@@ -108,10 +108,10 @@ def thresh_bloom_binary_prediction(obs,pred,threshold=8.03199999999999):
     return [Accuracy, True_pos, False_pos, True_neg, False_neg]
 
 
-def create_model(data,params,target,lib,pred,ensemble_sz=300):
+def create_model(data,params,target,samp,lib,pred,ensemble_sz=300):
     HAB_embed_block = get_block(data,50)
     parameters = pd.DataFrame(columns=['target', 'columns', 'E', 'theta', 'pred'])
-    for i in range(ensemble_sz):
+    for i in range(ensemble_sz*samp+1):
         E = params['E'].iloc[i]
         theta = params['theta'].iloc[i]
         embedding = params['columns'].iloc[i]
@@ -119,15 +119,15 @@ def create_model(data,params,target,lib,pred,ensemble_sz=300):
         df = smap_model['predictions']
         #bbp = thresh_bloom_binary_prediction(df['Observations'].iloc[1:-1],df['Predictions'].iloc[1:-1])
 
-        new_row = {'target': target, 'columns': embedding + [f'{target} (t-0)'], 'E': E,'theta':theta, 'pred':df['Predictions']}
+        new_row = {'target': target, 'columns': embedding, 'E': E,'theta':theta, 'pred':df['Predictions']}
         parameters.loc[len(parameters)] = new_row
-
+    #print(parameters['columns'].apply(lambda x: x[-3:-1]))
     return parameters
 
 
 
 def ensemble_binary_bloom(parameters_df,n=300,p=0.05,samp=1,bloom_thresh=8.013):
-    parameters_df = parameters_df.iloc[:n*samp].sample(n)
+    parameters_df = parameters_df.iloc[0:n*samp:samp]#.sample(n)
     sum = np.zeros(np.array(parameters_df['pred'].iloc[0][1:]).size)
     for i in range(n):
         curr = np.array(parameters_df['pred'].iloc[i][1:]) > bloom_thresh#np.percentile(parameters_df['pred'].iloc[i].iloc[1:],95)#
@@ -144,11 +144,11 @@ target (string) - variable to forecast bloom of
 returns forecast for next time step given the dataframe, and number of models which predicted True
 '''
 
-def next_forecast(data,params,target,n=300,p=0.05,lib_off=-2):#data,params,target,lib,pred,ensemble_sz=300
-    lib = '1 ' + str(data.shape[0] + lib_off) 
-    pred = '' + str(data.shape[0] + lib_off + 1) + ' ' + str(data.shape[0])
-    parameters = create_model(data,params,target,lib,pred)
-    preds = ensemble_binary_bloom(parameters,n=n,p=p,samp=1,bloom_thresh=8.013)
+def next_forecast(data,params,target,bloom_thresh=7,n=300,p=0.05,samp=1,lib_off=-2):#data,params,target,lib,pred,ensemble_sz=300
+    lib = '1 1036'#lib = '1 ' + str(data.shape[0] + lib_off) 
+    pred = '1037 ' + str(data.shape[0]) #pred = '' + str(data.shape[0] + lib_off + 1) + ' ' + str(data.shape[0])
+    parameters = create_model(data,params,target,samp,lib,pred,ensemble_sz=n)
+    preds = ensemble_binary_bloom(parameters,n=n,p=p,samp=samp,bloom_thresh=bloom_thresh)
     return preds> (n*p), preds
 
 
@@ -156,7 +156,6 @@ def clean_data(data_path):
     paper_data = pd.read_csv(data_path)
     paper_data = paper_data.set_index('time')
     paper_data['Time'] = paper_data.index.astype(int)
-    paper_data['Avg_Chloro'] #= paper_data['Avg_Chloro'].apply(np.log1p) #LOG AMPUTATION
     #IMPUTE HAB DATA
     #Build basic linear regression model as sanity check
     # Custom impute missing values with the average of the value in front and behind of it 
@@ -191,12 +190,22 @@ def process_parameters(path):
     parameters = pd.read_csv(path) 
     parameters['pred'] = parameters['pred'].apply(str_to_list)
     parameters['columns'] = parameters['columns'].apply(ast.literal_eval)
+    parameters.sort_values(by='rmse',ascending=False)
     return parameters
 
 
 def load_yaml(file_path):
     with open(file_path, 'r') as f:
         return yaml.safe_load(f)
+    
+def eval_ensemble(obs_blooms, pred_blooms):
+    Accuracy = 1 - (obs_blooms ^ pred_blooms).mean()
+    True_pos = (obs_blooms & pred_blooms).sum() / obs_blooms.sum()
+    False_pos = ((~obs_blooms) & pred_blooms).sum() / (~obs_blooms).sum()
+    True_neg = ((~obs_blooms) & (~pred_blooms)).sum() / (~obs_blooms).sum()
+    False_neg = (obs_blooms & (~pred_blooms)).sum() / obs_blooms.sum()
+    
+    return [Accuracy, True_pos, False_pos, True_neg, False_neg]
 
 
 def main():
@@ -210,10 +219,33 @@ def main():
         print(f"{key}: {value}")
     data = clean_data(config['data_path'])
     parameters = process_parameters(config['parameters_path'])
-    forecast, num_models = next_forecast(data,parameters,config['target'],n=config['n'],p=config['p'])
+    forecast, num_models = next_forecast(data,parameters,config['target'],bloom_thresh=config['bloom_thresh'],n=config['n'],p=config['p'],samp=config['samp'])
     #output to JSON
     print(f'Bloom prediction: {forecast[-1]}')
     print(f'Num of models which predict bloom: {num_models[-1]}')
+    testing = True
+    if testing:
+        start_index = 1099
+        observations = np.array(data[config['target']].iloc[start_index:]) > config['bloom_thresh']
+        print(observations)
+        forecasts = []
+        for i in range(start_index ,data.shape[0]):
+            temp_data = data[:i] #will forecast data point @ start_index
+            forecast, num_models = next_forecast(temp_data,parameters,config['target'],bloom_thresh=config['bloom_thresh'],n=config['n'],p=config['p'],samp=config['samp'])
+            forecasts.append(forecast[-1])
+            print(f'\n number of models predicted bloom: {num_models[-1]}')
+            print(f'Chloro level: {np.array(data[config['target']].iloc[start_index:])[i-start_index]}')
+            if forecast[-1] == observations[i-start_index]:
+                print('Correct')
+            else:
+                print('Incorrect')
+        results = eval_ensemble(observations, np.array(forecasts))
+        print(f'Accuracy: {results[0]}')
+        print(f'True Positive: {results[1]}')
+        print(f'False Positive {results[2]}')
+        print(f'True Negative: {results[3]}')
+        print(f'False Negative: {results[4]}')
+        print(forecasts)
 
 if __name__ == "__main__":
     main()
