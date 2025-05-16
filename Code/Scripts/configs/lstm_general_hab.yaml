@@ -1,0 +1,10 @@
+data_path: "../Data/carter_data_w_gaps.csv"
+parameters_path: "../1000_sample_HAB_carter_models.csv"
+target: "Avg_Chloro"
+bloom_thresh: 5.977
+samp: 20
+n: 500
+p: 0.2
+forecast_type: lstm
+data_bank_sz: 500
+train_sz: 800
