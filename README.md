@@ -51,16 +51,16 @@ Example snippet:
 
 ```yaml
 # my_config.yaml
-data_path: ../data/bloom_backup.csv
-parameters_path_1wk: ../models/1wk_params.pkl
-parameters_path_2wk: ../models/2wk_params.pkl
-parameters_path_3wk: ../models/3wk_params.pkl
-target: Chlorophyll_a
-json_key_path: ../secrets/my_service_account.json
-bloom_thresh: 3000
-samp: 5
-n: 100
-p: 60
+data_path: "../Data/d1carter_data_w_gaps.csv"
+parameters_path_1wk: "/Users/athulithparaselli/Documents/GitHub/HAB-Prediction-Research/Code/Results/1000_sample_biolum_1_wk.csv"
+parameters_path_2wk: "/Users/athulithparaselli/Documents/GitHub/HAB-Prediction-Research/Code/Results/1000_sample_biolum_2_wk.csv"
+parameters_path_3wk: "/Users/athulithparaselli/Documents/GitHub/HAB-Prediction-Research/Code/Results/1000_sample_biolum_3_wk.csv"
+target: "Lingulodinium_polyedra"
+json_key_path: "/Users/athulithparaselli/Documents/GitHub/HAB-Prediction-Research/Code/APIKey/sacred-truck-461716-t5-2a6499bf0869.json"
+bloom_thresh: 11733.399999999963
+samp: 40
+n: 750
+p: 0.3
 ```
 
 ---
