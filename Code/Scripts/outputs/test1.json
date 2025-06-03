@@ -1,0 +1,23 @@
+[
+  {
+    "Bloom_type": "Bioluminescent",
+    "day": "Tuesday",
+    "Date": "2025-06-03",
+    "CI": 55.111111111111114,
+    "Likeliness": "Unlikely"
+  },
+  {
+    "Bloom_type": "Bioluminescent",
+    "day": "Tuesday",
+    "Date": "2025-06-10",
+    "CI": 84.44444444444444,
+    "Likeliness": "Unlikely"
+  },
+  {
+    "Bloom_type": "Bioluminescent",
+    "day": "Tuesday",
+    "Date": "2025-06-17",
+    "CI": 73.33333333333334,
+    "Likeliness": "Unlikely"
+  }
+]
