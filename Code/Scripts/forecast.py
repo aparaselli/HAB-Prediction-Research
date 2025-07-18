@@ -414,7 +414,7 @@ def main():
 
     #Gather results
     print(f'Bloom prediction 1wk: {forecast[-1]}')
-    print(f'Confidence for 1wk pred: {proxy_confidence_of_pred(num_models[-1], config['n'],config['p'])*100}')
+    print(f"Confidence for 1wk pred: {proxy_confidence_of_pred(num_models[-1], config['n'],config['p'])*100}")
     print(f'Num of models which predict bloom 1wk: {num_models[-1]}')
     if forecast[-1]:
         forecast_pred_1wk = "Likely"
