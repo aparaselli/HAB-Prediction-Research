@@ -41,7 +41,9 @@ class EDM_bank():
         lib = '1 ' + str(self.lib_sz) 
         pred = '' + str(self.lib_sz + 1) + ' ' + str(x.shape[0])
         parameters_df = create_model(x,self.params,self.target,self.samp,lib,pred,ensemble_sz=self.n)
-        parameters_df = parameters_df.iloc[0:self.n*self.samp:self.samp]#.sample(n)
+        #print(parameters_df.shape[0])
+        #parameters_df = parameters_df.iloc[0:self.n*self.samp:self.samp]#.sample(n) DEPRECIATED
+        #print(parameters_df.shape[0])
         model_preds = np.stack(
             [np.asarray(parameters_df["pred"].iloc[i][1:-1]) for i in range(self.n)]
         )
