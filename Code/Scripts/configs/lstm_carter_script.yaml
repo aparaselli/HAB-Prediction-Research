@@ -1,5 +1,5 @@
-data_path: "../Data/d1carter_data_w_gaps.csv"
-parameters_path: "../Results/1000_sample_biolum_1_wk.csv"
+data_path: "/content/HAB-Prediction-Research/Code/Data/d1carter_data_w_gaps.csv"
+parameters_path: "/content/HAB-Prediction-Research/Code/Results/1000_sample_biolum_1_wk.csv"
 target: "Lingulodinium_polyedra"
 bloom_thresh: 5.977
 samp: 40
