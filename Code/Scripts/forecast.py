@@ -442,7 +442,7 @@ def main():
 
     #Gather results
     print(f'Bloom prediction 2wk: {forecast[-1]}')
-    print(f'Confidence for 2wk pred: {proxy_confidence_of_pred(num_models[-1], config['n'],config['p'])*100}')
+    print(f"Confidence for 2wk pred: {proxy_confidence_of_pred(num_models[-1], config['n'],config['p'])*100}")
     print(f'Num of models which predict bloom 2wk: {num_models[-1]}')
     if forecast[-1]:
         forecast_pred_2wk = "Likely"
@@ -471,7 +471,7 @@ def main():
 
     #Gather results
     print(f'Bloom prediction 3wk: {forecast[-1]}')
-    print(f'Confidence for 3wk pred: {proxy_confidence_of_pred(num_models[-1], config['n'],config['p'])*100}')
+    print(f"Confidence for 3wk pred: {proxy_confidence_of_pred(num_models[-1], config['n'],config['p'])*100}")
     print(f'Num of models which predict bloom 3wk: {num_models[-1]}')
     if forecast[-1]:
         forecast_pred_3wk = "Likely"
