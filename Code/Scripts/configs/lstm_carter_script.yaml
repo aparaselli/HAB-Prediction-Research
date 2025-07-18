@@ -1,8 +1,8 @@
 data_path: "../Data/d1carter_data_w_gaps.csv"
-parameters_path: "../800_sample_bioluminescent_driver_carter_models.csv"
+parameters_path: "../Results/1000_sample_biolum_3_wk.csv"
 target: "Lingulodinium_polyedra"
 bloom_thresh: 5.977
-samp: 40
+samp: 5
 n: 750
 p: 0.2
 forecast_type: lstm

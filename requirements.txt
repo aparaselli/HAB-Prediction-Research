@@ -1,0 +1,95 @@
+# Core scientific stack
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.2.3
+matplotlib==3.9.4
+scikit-learn==1.6.0
+
+# Jupyter ecosystem
+jupyter
+notebook
+jupyterlab
+ipykernel
+ipywidgets
+jupyterlab-widgets
+jupyter-console
+jupyterlab-server
+jupyter-server
+jupyter-core
+jupyter-client
+
+# Parsing, formatting, and display
+pyyaml==6.0.2
+pyparsing==3.2.0
+jsonschema
+json5
+traitlets==5.14.3
+nest-asyncio
+prometheus-client
+qtpy
+qtconsole
+markupsafe==2.1.3
+webencodings
+mistune==2.0.4
+beautifulsoup4==4.12.3
+soupsieve==2.5
+bleach==6.2.0
+defusedxml
+pygments==2.15.1
+
+# HTTP, async, networking
+httpx==0.27.0
+httpcore==1.0.2
+h11==0.14.0
+requests==2.32.3
+urllib3==2.2.3
+idna==3.7
+charset-normalizer
+anyio==4.6.2
+sniffio
+websocket-client
+
+# Utilities & support
+contourpy==1.3.0
+cycler==0.12.1
+fonttools==4.55.3
+joblib==1.4.2
+kiwisolver==1.4.7
+threadpoolctl==3.5.0
+tzdata==2024.2
+pyedm==2.1.0
+typing-extensions==4.11.0
+six==1.16.0
+zipp==3.21.0
+importlib-metadata
+importlib-resources==6.4.5
+platformdirs
+packaging==24.2
+debugpy==1.6.7
+pyzmq
+psutil
+pillow==11.0.0
+
+# Logging and data display
+python-dateutil
+python-json-logger
+stack_data
+pure_eval
+executing
+
+# Prompt and input handling
+prompt-toolkit==3.0.43
+wcwidth
+
+# YAML / config parsing
+tomli==2.0.1
+pycparser
+cffi
+
+# For backcompat and notebook support
+setuptools==75.1.0
+pip==24.2
+wheel==0.44.0
+
+# Optional but often needed
+zstandard
