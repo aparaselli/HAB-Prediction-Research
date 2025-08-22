@@ -6,7 +6,9 @@ from torch.utils.data import Dataset
 import numpy as np
 from torch.utils.data import TensorDataset, DataLoader
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import os
+from copy import deepcopy 
 from torch.utils.data import ConcatDataset
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from sklearn.metrics import balanced_accuracy_score
@@ -183,6 +185,7 @@ def train_model(
     loss_func=torch.nn.CrossEntropyLoss(),  # for classification or BCEWithLogitsLoss
     device="cpu",
     patience=10,
+    test_loader = None
 ):
     """
     Train a PyTorch model with support for both CrossEntropyLoss and BCEWithLogitsLoss.
@@ -197,11 +200,11 @@ def train_model(
         mode='min',
         factor=0.5,
         patience=200,
-        min_lr=1e-7,
-        verbose=True
+        min_lr=1e-7
     )
     best_val = float("inf")
     best_auc = 0.0 
+    final_test_auc = 0.0
     wait = 0
 
     train_losses = []
@@ -262,15 +265,43 @@ def train_model(
         bal_acc = balanced_accuracy_score(y_true, y_pred)
         auc = roc_auc_score(y_true, y_score)
 
+        
+        test_auc = None
+        if test_loader is not None:
+            t_trues, t_scores = [], []
+            with torch.no_grad():
+                for Xb, yb in test_loader:
+                    Xb, yb = Xb.to(device), yb.to(device)
+                    logits = model(Xb)
+                    # match your val logic for probs:
+                    if isinstance(loss_func, torch.nn.BCEWithLogitsLoss):
+                        # two-logit or single-logit head
+                        if logits.dim() == 1 or logits.size(-1) == 1:
+                            probs = torch.sigmoid(logits.view(-1))
+                        else:
+                            probs = torch.sigmoid(logits[:, 1])
+                    else:
+                        probs = torch.softmax(logits, dim=1)[:, 1]
+                    t_trues.append(yb.cpu().numpy())
+                    t_scores.append(probs.cpu().numpy())
+            y_true_t  = np.concatenate(t_trues)
+            y_score_t = np.concatenate(t_scores)
+            test_auc  = roc_auc_score(y_true_t, y_score_t)
+
         if ep % 50 == 0:
+          if test_loader is None:
             print(f"Epoch {ep:3d}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  bal_acc={bal_acc:.4f}  auc={auc:.4f}")
+          else:
+            print(f"Epoch {ep:3d}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  bal_acc={bal_acc:.4f}  val_auc={auc:.4f} test_auc={test_auc:.4f}")
+
 
         # ---- EARLY STOPPING ----
         #if val_loss < best_val:
             #best_val = val_loss
         if auc > best_auc:
             best_auc   = auc
-            best_state = model.state_dict()
+            best_state = deepcopy(model.state_dict())
+            final_test_auc = test_auc
             wait = 0
         else:
             wait += 1
@@ -291,11 +322,31 @@ def train_model(
     plt.show()
 
     if best_state is not None:
-        print(f"Loading best model (AUC={best_auc:.4f})")
+        #print(f"Loading best model (AUC={best_auc:.4f}) Test_AUC={final_test_auc:.4f})")
         model.load_state_dict(best_state)
+
+        if test_loader is not None:
+            t_trues, t_scores = [], []
+            with torch.no_grad():
+                for Xb, yb in test_loader:
+                    Xb, yb = Xb.to(device), yb.to(device)
+                    logits = model(Xb)
+                    if isinstance(loss_func, torch.nn.BCEWithLogitsLoss):
+                        if logits.dim() == 1 or logits.size(-1) == 1:
+                            probs = torch.sigmoid(logits.view(-1))
+                        else:
+                            probs = torch.sigmoid(logits[:, 1])
+                    else:
+                        probs = torch.softmax(logits, dim=1)[:, 1]
+                    t_trues.append(yb.cpu().numpy())
+                    t_scores.append(probs.cpu().numpy())
+            y_true_t  = np.concatenate(t_trues)
+            y_score_t = np.concatenate(t_scores)
+            final_test_auc = roc_auc_score(y_true_t, y_score_t)
+        print(f"Loading best model (val AUC={best_auc:.4f})  Test_AUC={final_test_auc:.4f}")
     else:
         print("Best model not loaded")
-    return model
+    return model, final_test_auc
 
         
 
@@ -397,10 +448,50 @@ class NoisySequenceDataset(Dataset):
         return noisy_window, target
 
     
+def best_threshold_from_roc(model, loader, device="cpu", pos_label=1,
+                            method="youden", 
+                            c_fp=1.0, c_fn=1.0, prevalence=None):
+    model.eval()
+    y_true, y_score = [], []
+    with torch.no_grad():
+        for Xb, yb in loader:
+            Xb = Xb.to(device)
+            logits = model(Xb)           
+            if logits.dim()==1 or logits.size(-1)==1:    
+                probs = torch.sigmoid(logits.view(-1))
+            else:                                        
+                diff = logits[:, pos_label] - logits[:, 1 - pos_label]
+                probs = torch.sigmoid(diff)
+            y_true.extend(yb.cpu().numpy())
+            y_score.extend(probs.cpu().numpy())
+
+    fpr, tpr, thresholds = roc_curve(y_true, y_score, pos_label=pos_label)
+
+    finite = np.isfinite(thresholds)
+    fpr, tpr, thresholds = fpr[finite], tpr[finite], thresholds[finite]
+
+    if method == "youden":
+        j = tpr - fpr
+        idx = np.argmax(j)
+
+    elif method == "topleft":
+        idx = np.argmin((fpr - 0.0)**2 + (1.0 - tpr)**2)
+
+    elif method == "cost":
+        if prevalence is None:
+            prevalence = np.mean(y_true)
+        cost = c_fp*(1 - prevalence)*fpr + c_fn*prevalence*(1 - tpr)
+        idx = np.argmin(cost)
+
+    else:
+        raise ValueError("method must be 'youden', 'topleft', or 'cost'")
+
+    best_thr = float(thresholds[idx])
+    stats = dict(threshold=best_thr, tpr=float(tpr[idx]), fpr=float(fpr[idx]))
+    return best_thr, stats
 
 
-
-def eval_confusion(model, loader, device="cpu", labels=None, title="Confusion Matrix"):
+def eval_confusion(model, loader, device="cpu", labels=None, title="Confusion Matrix",threshold=0.5,pos_label=1):
     model.eval()
     all_trues = []
     all_preds = []
@@ -408,7 +499,12 @@ def eval_confusion(model, loader, device="cpu", labels=None, title="Confusion Ma
         for Xb, yb in loader:
             Xb, yb = Xb.to(device), yb.to(device)
             logits = model(Xb)
-            preds  = torch.argmax(logits, dim=1)
+            if logits.dim()==1 or logits.size(-1)==1:
+                probs = torch.sigmoid(logits.view(-1))
+            else:
+                diff  = logits[:, pos_label] - logits[:, 1 - pos_label]
+                probs = torch.sigmoid(diff)
+            preds = (probs >= threshold).long()
             all_trues.append(yb.cpu())
             all_preds.append(preds.cpu())
 
@@ -422,6 +518,16 @@ def eval_confusion(model, loader, device="cpu", labels=None, title="Confusion Ma
     fig, ax = plt.subplots(figsize=(5,5))
     disp.plot(ax=ax, cmap="Blues", colorbar=False)
     plt.title(title)
+
+    # Prepare save path
+    safe_title = title.replace(" ", "_")
+    save_dir = "/content/HAB-Prediction-Research/Code/Results"
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"{safe_title}.png")
+
+    # Save before showing
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+
     plt.show()
     return cm
 
@@ -471,6 +577,7 @@ def plot_predictions(
     else:
         plt.show()
 
+'''
 def plot_roc_with_thresholds(model, loader, device="cpu", pos_label=1, n_labels=20):
     model.eval()
     y_true = []
@@ -511,7 +618,86 @@ def plot_roc_with_thresholds(model, loader, device="cpu", pos_label=1, n_labels=
     plt.title("ROC Curve with Thresholds")
     plt.legend(loc="lower right")
     plt.tight_layout()
+    # Save figure
+    save_path="/content/HAB-Prediction-Research/Code/Results/ROC_plot.png"
+    plt.savefig(save_path, dpi=300, bbox_inches="tight",
+                facecolor=plt.gcf().get_facecolor(),
+                edgecolor="none")
+
     plt.show()
+'''
+
+def plot_roc_with_thresholds(model, loader, device="cpu", pos_label=1,
+                             n_markers=10,  # kept for signature compatibility
+                             save_path="/content/HAB-Prediction-Research/Code/Results/ROC_plot.png",
+                             smooth=True, num_points=600):
+    model.eval()
+    y_true, y_score = [], []
+    with torch.no_grad():
+        for Xb, yb in loader:
+            Xb = Xb.to(device)
+            logits = model(Xb)
+            # Robust positive-class probability
+            if logits.dim() == 1 or logits.size(-1) == 1:        # single-logit head
+                probs = torch.sigmoid(logits.view(-1))
+            elif logits.size(-1) == 2:                            # two-logit head
+                diff = logits[:, pos_label] - logits[:, 1 - pos_label]
+                probs = torch.sigmoid(diff)
+            else:
+                probs = torch.softmax(logits, dim=1)[:, pos_label]
+            y_true.extend(yb.cpu().numpy())
+            y_score.extend(probs.cpu().numpy())
+
+    fpr, tpr, thresholds = roc_curve(y_true, y_score, pos_label=pos_label)
+    roc_auc = auc(fpr, tpr)
+
+    fig, ax = plt.subplots(figsize=(6.5, 6.5))
+
+    # --- Smooth-looking curve (cosmetic) ---
+    if smooth and len(fpr) > 2:
+        fpr_grid = np.linspace(0.0, 1.0, num_points)
+        try:
+            # Monotone cubic interpolation to avoid wiggles and preserve ordering
+            from scipy.interpolate import PchipInterpolator
+            tpr_grid = PchipInterpolator(fpr, tpr)(fpr_grid)
+        except Exception:
+            # Fallback: simple linear interpolation
+            tpr_grid = np.interp(fpr_grid, fpr, tpr)
+
+        # Keep within [0,1] and enforce monotonic increase
+        tpr_grid = np.clip(tpr_grid, 0.0, 1.0)
+        tpr_grid = np.maximum.accumulate(tpr_grid)
+
+        ax.plot(fpr_grid, tpr_grid, lw=2, label="ROC curve")
+    else:
+        # Exact empirical curve (step)
+        ax.step(fpr, tpr, where="post", lw=2, label="ROC curve")
+
+    # Chance line
+    ax.plot([0, 1], [0, 1], ls="--", lw=2, label="Random chance")
+
+    # Styling
+    ax.grid(True, ls="--", alpha=0.3)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1.02)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curve with AUC")
+
+    # AUC textbox (top-left)
+    ax.text(0.03, 0.97, f"AUC = {roc_auc:.3f}",
+            transform=ax.transAxes, ha="left", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8, ec="none"))
+
+    # Only keep the main legend
+    ax.legend(loc="lower right")
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
 
 
 
@@ -533,15 +719,75 @@ def main():
 
     parameters = process_parameters(config['parameters_path'])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print('Creating EDM Models and Embedding Data')
-    data_bank = EDM_bank(data_bank_sz,parameters,config['target'],config['samp'],config['n'])
-    embedder = Embedd_EDM(data_bank, data,config['forecast_type'])
+    if config['EDM_embed']:
+      print('Creating EDM Models and Embedding Data')
+      data_bank = EDM_bank(data_bank_sz,parameters,config['target'],config['samp'],config['n'])
+      embedder = Embedd_EDM(data_bank, data,config['forecast_type'])
 
-    orig = data[config['target']]
-    mask = ~orig.iloc[ config['data_bank_sz']+1 : ].isna().to_numpy() #Exlude NAN values from train and test data
-    X,y = embedder.get_data()
-    print(f'Pre NAN mask X size{X.shape}')
-    print(f'Pre NAN mask X size{y.shape}')
+      orig = data[config['target']]
+      mask = ~orig.iloc[ config['data_bank_sz']+1 : ].isna().to_numpy() #Exlude NAN values from train and test data
+      X,y = embedder.get_data()
+      print(f'Pre NAN mask X size{X.shape}')
+      print(f'Pre NAN mask X size{y.shape}')
+      VAL_LEN = 100
+      assert train_sz > VAL_LEN + config['seq_len'], "Increase train_sz or reduce seq_len."
+
+      train_core_end = train_sz - VAL_LEN  
+    else:
+        print('Building base features (no EDM)')
+
+        target_col = config['target']
+
+        # Copy original data
+        df = data.copy()
+
+        # 1) Base features from numeric columns; drop target from X
+        num_df = df.select_dtypes(include=[np.number]).copy()
+        if target_col not in num_df.columns:
+            raise ValueError(f"Target '{target_col}' must be numeric and present in the dataframe.")
+
+        X_df = num_df.drop(columns=[target_col])
+        y_sr = num_df[target_col]
+
+        # 2) Impute: forward-fill then back-fill
+        X_df = X_df.ffill().bfill()
+        y_sr = y_sr.ffill().bfill()
+
+        # 3) Numpy arrays
+        X_np_all = X_df.to_numpy(dtype=np.float32)
+        y_np_all = y_sr.to_numpy(dtype=np.float32)
+
+        # ----- Keep test size identical to the EDM pipeline -----
+        # Original code skipped the first (data_bank_sz + 1) rows.
+        warmup = config['data_bank_sz'] + 1
+
+        # Expand effective train size to include the warmup chunk
+        # so that the test set length remains unchanged.
+        train_sz = config['train_sz'] + warmup
+
+        # 4) Mask over the FULL series (no databank offset now)
+        # Downstream code slices this as mask[:train_sz] and mask[train_sz:].
+        orig = y_sr
+        mask = ~orig.isna().to_numpy()
+
+        # 5) Standardize using TRAIN-ONLY stats from the expanded train slice
+        train_X_np = X_np_all[:train_sz]
+        mu = np.nanmean(train_X_np, axis=0)
+        sigma = np.nanstd(train_X_np, axis=0)
+        sigma[sigma == 0] = 1.0  # guard against constant columns
+        X_np_all = (X_np_all - mu) / sigma
+
+        # 6) Tensors
+        X = torch.from_numpy(X_np_all)            # [T, n_features]
+        y = torch.from_numpy(y_np_all).float()    # [T]
+
+        print(f'Base features X shape: {X.shape}  | y shape: {y.shape}')
+        # Ensure config['n'] matches detected feature count
+        if config['n'] != X.shape[1]:
+            print(f"[WARN] config['n']={config['n']} ≠ n_features={X.shape[1]}. "
+                  f"Using detected n_features. Consider updating your config.")
+            config['n'] = X.shape[1]
+
 
 
 
@@ -572,13 +818,15 @@ def main():
             save_path="plots/test_true_vs_pred.png"
         )
     elif config['forecast_type'] == 'lstm':
-        t2 = np.percentile(data[config['target']].iloc[:data_bank_sz],95) #V
+        t2 = np.percentile(data[config['target']],95) 
         print(f"Bloom threshold is {t2}")
         bins = torch.tensor([t2], dtype=torch.float32)# for 2 class
         y = torch.bucketize(y, bins) 
-
+        Val_carve_sz = 126 #take 100 samples from train as validation
+        train_sz = train_sz - Val_carve_sz
         train_X, train_y = X[:train_sz], y[:train_sz]
-        test_X,  test_y  = X[train_sz:], y[train_sz:]
+        val_X, val_y = X[train_sz:train_sz+Val_carve_sz], y[train_sz:train_sz+Val_carve_sz]
+        test_X,  test_y  = X[train_sz+Val_carve_sz:], y[train_sz+Val_carve_sz:]
 
         seq_len = config['seq_len']  # How many steps before will the LSTM use to make a decision
 
@@ -637,36 +885,51 @@ def main():
         print("Total noisy training observations:", sum([len(ds) for ds in noisy_subs]))
         print("Total training observations:", len(augmented_ds))
 
-        # 1. carve off the test‐portion of the mask
-        mask_test = mask[train_sz:]              # length = len(X) - train_sz
+        # --- Adjacent blocked VAL and TEST with a purge gap to avoid leakage ---
+        batch_sz = config['batch_sz']
+        GAP      = config['seq_len']           # purge gap >= seq_len
+        VAL_LEN  = Val_carve_sz                # keep your current val length
+        train_end = train_sz                   # end of train slice (after you subtracted Val_carve_sz above)
 
-        # 2. find the “good” indices *within* that test slice
-        #    these are offsets 0…len(mask_test)-1
-        good_test_local = np.where(mask_test)[0]
+        val_start  = train_end + GAP
+        val_end    = val_start + VAL_LEN
+        test_start = val_end
+        test_end   = len(X)
 
-        # 3. split into contiguous runs
-        breaks = np.where(np.diff(good_test_local) != 1)[0] + 1
-        segments_test = np.split(good_test_local, breaks)
+        # -------- Build VALIDATION dataset (contiguous good runs only) --------
+        mask_val = mask[val_start:val_end]
+        good_val_local = np.where(mask_val)[0]
+        cuts = np.where(np.diff(good_val_local) != 1)[0] + 1
+        runs = [r for r in np.split(good_val_local, cuts) if len(r) > seq_len]
 
-        # 4. for each run, build a SequenceDataset
         val_subs = []
-        for seg in segments_test:
-            if len(seg) <= seq_len:
-                continue
-
-            # seg is local to the test slice, so convert back to global X/y indices
-            seg_global = seg + train_sz
-
-            Xi = X[seg_global]   # shape (T_seg, n)
-            yi = y[seg_global]   # shape (T_seg,)
-
-            val_subs.append( SequenceDataset(Xi, yi, seq_len) )
-
-        # 5. concat them all
+        for r in runs:
+            seg_global = r + val_start
+            Xi = X[seg_global]           # shape (T_seg, n)
+            yi = y[seg_global]           # shape (T_seg,)
+            val_subs.append(SequenceDataset(Xi, yi, seq_len))
         val_ds = ConcatDataset(val_subs)
+        print("Total validation observations:", len(val_ds))
 
-        # 6. make your DataLoader
-        print("Total testing observations:", len(val_ds))
+        # -------- Build TEST dataset (contiguous good runs only) --------------
+        mask_test = mask[test_start:test_end]
+        good_test_local = np.where(mask_test)[0]
+        cuts = np.where(np.diff(good_test_local) != 1)[0] + 1
+        runs = [r for r in np.split(good_test_local, cuts) if len(r) > seq_len]
+
+        test_subs = []
+        for r in runs:
+            seg_global = r + test_start
+            Xi = X[seg_global]           # shape (T_seg, n)
+            yi = y[seg_global]           # shape (T_seg,)
+            test_subs.append(SequenceDataset(Xi, yi, seq_len))
+        test_ds = ConcatDataset(test_subs)
+        print("Total testing observations:", len(test_ds))
+
+        # loaders
+        val_loader  = DataLoader(val_ds,  batch_size=batch_sz, shuffle=False)
+        test_loader = DataLoader(test_ds, batch_size=batch_sz, shuffle=False)
+
         
         flat_labels = []
         for ds in vanilla_subs:
@@ -677,86 +940,145 @@ def main():
         train_ds = ConcatDataset(vanilla_subs)
         assert len(train_labels) == len(train_ds)
 
-        # NEW: define class_weights based on train_labels
+        
         num_classes = 2
         counts = torch.bincount(train_labels, minlength=num_classes).float()
         inv_freq = 1.0 / counts
         class_weights = inv_freq / inv_freq.sum() * len(counts)
 
         # use class_weights to generate per-sample weights
-        sample_weights = class_weights[train_labels]
+        # labels for ALL samples in augmented_ds
+        labels_aug = torch.tensor([int(augmented_ds[i][1]) for i in range(len(augmented_ds))])
+
+        # inverse-frequency class weights → per-sample weights
+        class_counts   = torch.bincount(labels_aug, minlength=2).float()
+        class_weights  = 1.0 / class_counts
+        sample_weights = class_weights[labels_aug].double()
+
+        # (optional) sanity check
+        assert len(sample_weights) == len(augmented_ds)
 
 
-        sampler = torch.utils.data.WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(augmented_ds),  # total samples = vanilla + noisy
-            replacement=True
-        )
-        batch_sz = config['batch_sz']
-        orig_train_loader = DataLoader(train_ds, batch_size=batch_sz, shuffle=False)
-        train_loader = DataLoader(augmented_ds, batch_size=batch_sz, sampler=sampler)
 
-        test_loader   = DataLoader(val_ds,   batch_size=batch_sz, shuffle=False)
-        '''
-        model = BiLSTMClassifier(
-            input_size = config['n'],
-            hidden_size = 16,
-            num_layers  = 3,
-            num_classes = 2,
-            dropout     = 0.5
-        ).to(device)
-        '''
+
         channel_sz = config['tcn_channel']
-        model = HybridTAB(
-            input_size = config['n'],
-            tcn_channels=[channel_sz,channel_sz],  #started with 64 x 64  
-            mha_heads=config['atn_hds'],
-            lstm_hidden=config['lstm_hd_sz'],
-            lstm_layers=config['lstm_num_lyrs'],
-            num_classes=2,           # or 4, depending on your task
-            dropout=config['dropout']
-        ).to(device)
+
+        # Start training model using grad descent and embeddings 
+        num_repeats = 3
+        best_auc = 0.0
+        aucs = []
+        for i in range(num_repeats):
+          # new random seed
+          fresh_seed = torch.seed() 
+          py_seed = int(fresh_seed % (2**32 - 1))
+          random.seed(py_seed)
+          np.random.seed(py_seed)
+          torch.manual_seed(fresh_seed)
+          torch.cuda.manual_seed_all(fresh_seed)
 
 
-
-
-        weights = torch.tensor([config['bloom_pen'], 1.0], device=device)
-        loss_func = nn.CrossEntropyLoss(weight=weights)
-        print('Training model')
-        model.to(device)
-        train_model(model, train_loader, test_loader, epochs=100000,lr=config['learning_rate'],loss_func=loss_func,device=device,patience=400)
-
-        save_path = config["save_path"]
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-        # save only the model’s weights
-        torch.save(model.state_dict(), save_path)
-        print(f"Model weights saved to {save_path}")
-
-
-        #class_names = ["no bloom", "slight", "moderate", "strong"]
-        class_names = ["no bloom", "bloom"]
-
-        print("=== Train Confusion Matrix ===")
-        cm_train = eval_confusion(model, train_loader, device, labels=class_names,
-                                title="Train: True vs Predicted")
-
-        print("=== Original Train Confusion Matrix ===")
-        cm_orig = eval_confusion(
-            model,
-            orig_train_loader,
-            device,
-            labels=class_names,
-            title="Original Train: True vs Predicted"
-)
-
-
-        print("=== Test Confusion Matrix ===")
-        cm_test  = eval_confusion(model, test_loader,  device, labels=class_names,
-                                title="Test: True vs Predicted")
         
-        print("=== Test ROC ===")
-        plot_roc_with_thresholds(model, test_loader, device=device, pos_label=1)
-    
+          print(f"Starting run {i}")
+          sampler = torch.utils.data.WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(augmented_ds),   # or any epoch length you like
+            replacement=True
+          )
+
+          
+          orig_train_loader = DataLoader(train_ds, batch_size=batch_sz, shuffle=False)
+          train_loader = DataLoader(augmented_ds, batch_size=batch_sz, sampler=sampler)
+
+
+          #create model
+          model = HybridTAB(
+              input_size = config['n'],
+              tcn_channels=[channel_sz,channel_sz],  #started with 64 x 64  
+              mha_heads=config['atn_hds'],
+              lstm_hidden=config['lstm_hd_sz'],
+              lstm_layers=config['lstm_num_lyrs'],
+              num_classes=2,           # or 4, depending on your task
+              dropout=config['dropout']
+          ).to(device)
+
+
+
+
+          weights = torch.tensor([1.0, config['bloom_pen']], device=device)
+          loss_func = nn.CrossEntropyLoss(weight=weights)
+          print('Training model')
+          model.to(device)
+          _,auc = train_model(model, train_loader, val_loader, epochs=100000,lr=config['learning_rate'],loss_func=loss_func,device=device,patience=400,test_loader=test_loader)
+          aucs.append(auc)
+          if auc > best_auc:
+            best_auc = auc
+            save_path = config["save_path"]
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+            # save only the model’s weights
+            torch.save(model.state_dict(), save_path)
+            thr, s = best_threshold_from_roc(model, val_loader, device=device, method="youden")
+            print(f"The threshold is {thr}")
+            print(f"Model weights saved to {save_path}")
+
+
+            #class_names = ["no bloom", "slight", "moderate", "strong"]
+            class_names = ["no bloom", "bloom"]
+
+            print("=== Train Confusion Matrix ===")
+            cm_train = eval_confusion(model, train_loader, device, labels=class_names,
+                                    title="Train: True vs Predicted",threshold=thr)
+
+            print("=== Original Train Confusion Matrix ===")
+            cm_orig = eval_confusion(
+                model,
+                orig_train_loader,
+                device,
+                labels=class_names,
+                title="Original Train: True vs Predicted",
+                threshold=thr
+            )
+
+
+            print("=== Test Confusion Matrix ===")
+            cm_test  = eval_confusion(model, test_loader,  device, labels=class_names,
+                                    title="Test: True vs Predicted",threshold=thr)
+            
+            print("=== Test ROC ===")
+            plot_roc_with_thresholds(model, test_loader, device=device, pos_label=1)
+        #Plot the AUCs    
+        df = pd.DataFrame({
+            "run": np.arange(1, len(aucs) + 1, dtype=int),
+            "auc": aucs
+        })
+        df.to_csv("/content/HAB-Prediction-Research/Code/Results/aucs.csv", index=False)
+
+        # --- Histogram of AUCs ---
+        fig, ax = plt.subplots(figsize=(8, 4))
+
+        vals = df["auc"].astype(float).values
+        auto_bins = np.histogram_bin_edges(vals, bins="auto")
+
+        n_bins = max(len(auto_bins) - 1, 10)
+
+        ax.hist(vals, bins=n_bins, edgecolor="black")
+
+        ax.set_xlabel("AUC")
+        ax.set_ylabel("Frequency")
+        ax.set_title("Distribution of AUC across runs")
+
+        # Optional: show mean and best as reference lines
+        ax.axvline(vals.mean(), linestyle="--", linewidth=1, label=f"Mean = {vals.mean():.3f}")
+        ax.axvline(vals.max(),  linestyle="-",  linewidth=1, label=f"Best = {vals.max():.3f}")
+        ax.legend()
+
+        fig.tight_layout()
+
+        png_path = "/content/HAB-Prediction-Research/Code/Results/aucs_hist.png"
+        fig.savefig(png_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+
+      
 if __name__ == "__main__":
     main()
