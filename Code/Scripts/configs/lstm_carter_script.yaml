@@ -6,8 +6,8 @@ samp: 40
 n: 750
 p: 0.2
 forecast_type: lstm
-data_bank_sz: 250
-train_sz: 400
+data_bank_sz: 200
+train_sz: 450
 seq_len: 10
 noisy_prop: 0.5
 noise_pct: 0.03
@@ -19,4 +19,5 @@ lstm_num_lyrs: 2
 dropout: 0.5
 bloom_pen: 1.5
 learning_rate: 0.00001
+EDM_embed: True
 save_path: "../Results/Lingulodinium_LSTM.pth"
