@@ -16,8 +16,8 @@ tcn_channel: 64
 atn_hds: 4
 lstm_hd_sz: 16
 lstm_num_lyrs: 2
-dropout: 0.5
+dropout: 0.8
 bloom_pen: 1.5
-learning_rate: 0.00001
+learning_rate: 0.0001
 EDM_embed: True
 save_path: "../Results/Lingulodinium_LSTM.pth"

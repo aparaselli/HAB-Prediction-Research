@@ -1,5 +1,5 @@
 from forecast import *  # load_yaml, clean_data, process_parameters, create_model, ...
-import argparse, random, os
+import argparse, random, os, math
 import numpy as np
 import pandas as pd
 import torch
@@ -9,12 +9,22 @@ from torch.utils.data import Dataset, TensorDataset, DataLoader, ConcatDataset
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, balanced_accuracy_score, roc_curve, auc, roc_auc_score
+from sklearn.metrics import (confusion_matrix, ConfusionMatrixDisplay,
+                             balanced_accuracy_score, roc_curve, auc, roc_auc_score)
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tcn_model import *  # HybridTABWithGate, TrustGate, HybridTAB
 from losses import *
 
 # ============================== EDM interface ===============================
+
+def count_windows(ds, name):
+    nb, bl = 0, 0
+    for _, target in ds:
+        if int(target) == 1:
+            bl += 1
+        else:
+            nb += 1
+    print(f"[WINDOWS for {name:<5}] total={len(ds):<4}  non-bloom={nb:<4}  bloom={bl:<4}")
 
 class EDM_bank():
     def __init__(self, lib_sz, params, target, samp, n):
@@ -167,9 +177,9 @@ def plot_roc_with_thresholds(model, loader, device="cpu", pos_label=1,
             if logits.dim()==1 or logits.size(-1)==1:
                 probs = torch.sigmoid(logits.view(-1))
             elif logits.size(-1) == 2:
-                probs = torch.sigmoid(logits[:, pos_label] - logits[:, 1 - pos_label])
+                probs = torch.sigmoid(logits[:, 1] - logits[:, 0])
             else:
-                probs = torch.softmax(logits, dim=1)[:, pos_label]
+                probs = torch.softmax(logits, dim=1)[:, 1]
             y_true.extend(yb.cpu().numpy()); y_score.extend(probs.cpu().numpy())
 
     fpr, tpr, _ = roc_curve(y_true, y_score, pos_label=pos_label)
@@ -246,123 +256,234 @@ def train_model(
     lr=1e-3,
     loss_func=torch.nn.CrossEntropyLoss(),
     device="cpu",
-    patience=10,
+    patience=120,
     test_loader=None,
     gate_reg_l1: float = 1e-4,
     gate_reg_bin: float = 1e-4,
     freeze_gate_epochs: int = 0,
 ):
-    model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=200, min_lr=1e-7)
+    import numpy as np
+    import torch
+    from torch import nn
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
+    from sklearn.metrics import balanced_accuracy_score, roc_curve, roc_auc_score
+    import matplotlib.pyplot as plt
 
+    model.to(device)
+
+    # ---------- EMA as a state_dict buffer (no Module deepcopy) ----------
+    @torch.no_grad()
+    def _clone_state_dict(sd):
+        return {k: v.detach().clone() for k, v in sd.items()}
+
+    ema_decay = 0.995
+    ema_state = _clone_state_dict(model.state_dict())
+
+    @torch.no_grad()
+    def ema_update():
+        msd = model.state_dict()
+        for k in ema_state.keys():
+            ema_state[k].mul_(ema_decay).add_(msd[k].detach(), alpha=1.0 - ema_decay)
+
+    # ---------- Optimizer / Scheduler ----------
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=60, min_lr=1e-7)
+
+    # ---------- Gate regularizer ----------
     def gate_regularizer(m):
-        if not hasattr(m, "gate"): return 0.0
+        if not hasattr(m, "gate"):
+            return 0.0
         g = torch.sigmoid(m.gate.gate_logits)
         eps = 1e-6
         l1_term  = g.mean()
         bin_term = -(g*torch.log(g+eps) + (1-g)*torch.log(1-g+eps)).mean()
         return gate_reg_l1 * l1_term + gate_reg_bin * bin_term
 
-    # optional warm-up: freeze the gate first N epochs
+    # Optional warm-up: freeze the gate for first N epochs
     if hasattr(model, "gate") and freeze_gate_epochs > 0:
-        for p in model.gate.parameters(): p.requires_grad_(False)
+        for p in model.gate.parameters():
+            p.requires_grad_(False)
 
     best_auc, final_test_auc, wait = 0.0, 0.0, 0
-    best_state, train_losses, val_losses = None, [], []
+    best_state = None  # will hold EMA weights
+    train_losses, val_losses = [], []
 
     for ep in range(1, epochs + 1):
-        # unfreeze gate after warm-up
+        # Unfreeze gate after warm-up
         if hasattr(model, "gate") and ep == freeze_gate_epochs + 1:
-            for p in model.gate.parameters(): p.requires_grad_(True)
+            for p in model.gate.parameters():
+                p.requires_grad_(True)
 
-        # ---- TRAIN ----
-        model.train(); running_train = 0.0
+        # -------------------- TRAIN (live weights) --------------------
+        model.train()
+        running_train = 0.0
         for Xb, yb in train_loader:
             Xb, yb = Xb.to(device), yb.to(device)
             optimizer.zero_grad()
-            logits = model(Xb)
-            loss = (loss_func(logits, yb) if not isinstance(loss_func, nn.BCEWithLogitsLoss)
-                    else loss_func(logits[:, 1], yb.float()))
-            loss = loss + gate_regularizer(model)
-            loss.backward(); optimizer.step()
-            running_train += loss.item()
-        train_loss = running_train / len(train_loader); train_losses.append(train_loss)
 
-        # ---- VAL ----
-        model.eval(); running_val = 0.0; all_trues, all_preds, all_scores = [], [], []
+            logits = model(Xb)
+            # Loss: handle CE (2 logits) or BCE-with-logits (single logit)
+            if isinstance(loss_func, nn.BCEWithLogitsLoss):
+                if logits.dim() > 1 and logits.size(-1) > 1:
+                    pos_logit = logits[:, 1]  # use the positive-class logit
+                else:
+                    pos_logit = logits.view(-1)
+                loss = loss_func(pos_logit, yb.float())
+            else:
+                loss = loss_func(logits, yb)
+
+            loss = loss + gate_regularizer(model)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            # Update EMA after each step
+            ema_update()
+
+            running_train += loss.item()
+
+        train_loss = running_train / max(1, len(train_loader))
+        train_losses.append(train_loss)
+
+        # -------------------- VALIDATION (swap in EMA) --------------------
+        running_val = 0.0
+        y_true_list, y_score_list = [], []
+
         with torch.no_grad():
+            live_state = _clone_state_dict(model.state_dict())   # save live
+            model.load_state_dict(ema_state, strict=False)       # load EMA
+
+            model.eval()
             for Xb, yb in val_loader:
                 Xb, yb = Xb.to(device), yb.to(device)
                 logits = model(Xb)
-                if isinstance(loss_func, nn.BCEWithLogitsLoss):
-                    probs = torch.sigmoid(logits[:, 1] if logits.size(-1) > 1 else logits.view(-1))
-                    loss = loss_func(logits[:, 1], yb.float())
-                    preds = (probs > 0.5).long()
-                else:
-                    probs = torch.softmax(logits, dim=1)[:, 1]
-                    loss = loss_func(logits, yb)
-                    preds = torch.argmax(logits, dim=1)
-                running_val += loss.item()
-                all_trues.append(yb.cpu()); all_preds.append(preds.cpu()); all_scores.append(probs.cpu().numpy())
 
-        val_loss = running_val / len(val_loader); val_losses.append(val_loss)
+                # probs for metrics
+                if logits.dim() > 1 and logits.size(-1) == 2:
+                    probs = torch.softmax(logits, dim=1)[:, 1]
+                else:
+                    # single logit path
+                    probs = torch.sigmoid(logits.view(-1))
+
+                # val loss
+                if isinstance(loss_func, nn.BCEWithLogitsLoss):
+                    if logits.dim() > 1 and logits.size(-1) > 1:
+                        pos_logit = logits[:, 1]
+                    else:
+                        pos_logit = logits.view(-1)
+                    loss_val = loss_func(pos_logit, yb.float())
+                else:
+                    loss_val = loss_func(logits, yb)
+
+                running_val += loss_val.item()
+                y_true_list.append(yb.cpu().numpy())
+                y_score_list.append(probs.cpu().numpy())
+
+            model.load_state_dict(live_state, strict=False)      # restore live
+
+        val_loss = running_val / max(1, len(val_loader))
+        val_losses.append(val_loss)
         scheduler.step(val_loss)
 
-        y_true  = np.concatenate(all_trues)
-        y_score = np.concatenate(all_scores)
-        y_pred  = torch.cat(all_preds).numpy()
-        bal_acc = balanced_accuracy_score(y_true, y_pred)
-        auc_val = roc_auc_score(y_true, y_score)
+        y_true  = np.concatenate(y_true_list) if y_true_list else np.array([])
+        y_score = np.concatenate(y_score_list) if y_score_list else np.array([])
 
+        # Balanced accuracy at ROC-optimal threshold (Youden J)
+        if y_true.size > 0 and np.unique(y_true).size == 2:
+            fpr, tpr, thresholds = roc_curve(y_true, y_score, pos_label=1)
+            finite = np.isfinite(thresholds)
+            fpr, tpr, thresholds = fpr[finite], tpr[finite], thresholds[finite]
+            if thresholds.size:
+                idx = np.argmax(tpr - fpr)
+                thr_opt = float(thresholds[idx])
+            else:
+                thr_opt = 0.5
+            y_pred = (y_score >= thr_opt).astype(int)
+            bal_acc = balanced_accuracy_score(y_true, y_pred)
+            auc_val = roc_auc_score(y_true, y_score)
+        else:
+            thr_opt, bal_acc, auc_val = 0.5, 0.5, 0.5  # degenerate safeguard
+
+        # -------------------- TEST (EMA) --------------------
         test_auc = None
         if test_loader is not None:
-            t_trues, t_scores = [], []
             with torch.no_grad():
+                live_state = _clone_state_dict(model.state_dict())
+                model.load_state_dict(ema_state, strict=False)
+
+                model.eval()
+                t_true, t_score = [], []
                 for Xb, yb in test_loader:
                     Xb, yb = Xb.to(device), yb.to(device)
                     logits = model(Xb)
-                    probs = (torch.sigmoid(logits[:, 1]) if logits.size(-1) > 1
-                             else torch.sigmoid(logits.view(-1)))
-                    t_trues.append(yb.cpu().numpy()); t_scores.append(probs.cpu().numpy())
-            y_true_t, y_score_t = np.concatenate(t_trues), np.concatenate(t_scores)
-            test_auc = roc_auc_score(y_true_t, y_score_t)
+                    if logits.dim() > 1 and logits.size(-1) == 2:
+                        probs = torch.softmax(logits, dim=1)[:, 1]
+                    else:
+                        probs = torch.sigmoid(logits.view(-1))
+                    t_true.append(yb.cpu().numpy())
+                    t_score.append(probs.cpu().numpy())
 
-        if ep % 10 == 0:
-            if test_loader is None:
-                print(f"Epoch {ep:3d}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  bal_acc={bal_acc:.4f}  auc={auc_val:.4f}")
-            else:
-                print(f"Epoch {ep:3d}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  bal_acc={bal_acc:.4f}  val_auc={auc_val:.4f} test_auc={test_auc:.4f}")
+                t_true = np.concatenate(t_true) if t_true else np.array([])
+                t_score = np.concatenate(t_score) if t_score else np.array([])
+                if t_true.size > 0 and np.unique(t_true).size == 2:
+                    test_auc = roc_auc_score(t_true, t_score)
+                model.load_state_dict(live_state, strict=False)
 
+        if ep % 5 == 0:
+            msg = (f"Epoch {ep:3d}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+                   f"bal_acc={bal_acc:.4f}  val_auc={auc_val:.4f}")
+            if test_loader is not None and test_auc is not None:
+                msg += f" test_auc={test_auc:.4f}"
+            msg += f" thr={thr_opt:.3f}"
+            print(msg)
+
+        # Early stop criterion on VAL AUC (using EMA snapshot)
         if auc_val > best_auc:
-            best_auc, best_state, final_test_auc, wait = auc_val, deepcopy(model.state_dict()), (test_auc or final_test_auc), 0
+            best_auc = auc_val
+            best_state = _clone_state_dict(ema_state)   # store EMA snapshot
+            final_test_auc = (test_auc or final_test_auc)
+            wait = 0
         else:
             wait += 1
             if wait >= patience:
                 print(f"⏹ Early stopping at epoch {ep}")
-                model.load_state_dict(best_state); break
+                break
 
-    plt.figure(figsize=(6,4))
-    plt.plot(train_losses, label="Train Loss"); plt.plot(val_losses, label="Val Loss")
-    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.legend(); plt.title("Training & Validation Loss")
-    plt.tight_layout(); plt.show()
+    # ---------- Plot losses ----------
+    try:
+        plt.figure(figsize=(6,4))
+        plt.plot(train_losses, label="Train Loss")
+        plt.plot(val_losses,   label="Val Loss")
+        plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.legend(); plt.title("Training & Validation Loss")
+        plt.tight_layout(); plt.show()
+    except Exception:
+        pass  # plotting optional
 
+    # ---------- Load best EMA snapshot and compute final TEST AUC ----------
     if best_state is not None:
-        model.load_state_dict(best_state)
+        model.load_state_dict(best_state, strict=False)
         if test_loader is not None:
-            t_trues, t_scores = [], []
             with torch.no_grad():
+                model.eval()
+                t_true, t_score = [], []
                 for Xb, yb in test_loader:
                     Xb, yb = Xb.to(device), yb.to(device)
                     logits = model(Xb)
-                    probs = (torch.sigmoid(logits[:, 1]) if logits.size(-1) > 1
-                             else torch.sigmoid(logits.view(-1)))
-                    t_trues.append(yb.cpu().numpy()); t_scores.append(probs.cpu().numpy())
-            final_test_auc = roc_auc_score(np.concatenate(t_trues), np.concatenate(t_scores))
-        print(f"Loading best model (val AUC={best_auc:.4f})  Test_AUC={final_test_auc:.4f}")
+                    if logits.dim() > 1 and logits.size(-1) == 2:
+                        probs = torch.softmax(logits, dim=1)[:, 1]
+                    else:
+                        probs = torch.sigmoid(logits.view(-1))
+                    t_true.append(yb.cpu().numpy()); t_score.append(probs.cpu().numpy())
+            t_true = np.concatenate(t_true) if t_true else np.array([])
+            t_score = np.concatenate(t_score) if t_score else np.array([])
+            if t_true.size > 0 and np.unique(t_true).size == 2:
+                final_test_auc = roc_auc_score(t_true, t_score)
+        print(f"Loading best EMA model (val AUC={best_auc:.4f})  Test_AUC={final_test_auc:.4f}")
     else:
         print("Best model not loaded")
+
     return model, final_test_auc
+
 
 # ================================== Main ====================================
 
@@ -376,7 +497,8 @@ def main():
 
     data = clean_data(config['data_path'])
     data_bank_sz = config['data_bank_sz']
-    train_sz = config['train_sz']
+    train_sz_cfg = config['train_sz']
+
     parameters = process_parameters(config['parameters_path'])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -387,8 +509,28 @@ def main():
         orig = data[config['target']]
         mask = ~orig.iloc[config['data_bank_sz']+1:].isna().to_numpy()
         X, y = embedder.get_data()
-        VAL_LEN = 100
-        assert train_sz > VAL_LEN + config['seq_len'], "Increase train_sz or reduce seq_len."
+
+        # ---------- Add seasonality features (sin/cos week-of-year) ----------
+        weeks = pd.to_datetime(data['DATE']).dt.isocalendar().week.to_numpy()
+        phi = 2*np.pi*weeks/52.0
+        season = torch.from_numpy(np.stack([np.sin(phi), np.cos(phi)], axis=1)).float()
+        season = season[data_bank_sz+1:]  # align to X,y
+        X = torch.cat([X, season], dim=1)
+
+        # ---------- Split sizes ----------
+        Val_carve_sz = int(config.get("val_len", 100))
+        train_sz = int(train_sz_cfg)
+        assert train_sz > Val_carve_sz + config['seq_len'], "Increase train_sz or reduce seq_len."
+
+        # ---------- Train-only scaling ----------
+        mu = X[:train_sz].mean(dim=0)
+        sigma = X[:train_sz].std(dim=0).clamp_min(1e-6)
+        X = (X - mu) / sigma
+
+        # ensure model input size matches
+        if config['n'] != X.shape[1]:
+            print(f"[INFO] Adjusting config['n'] from {config['n']} -> {X.shape[1]} after season+scaling.")
+            config['n'] = X.shape[1]
     else:
         print('Building base features (no EDM)')
         target_col = config['target']
@@ -400,7 +542,7 @@ def main():
         X_df, y_sr = X_df.ffill().bfill(), y_sr.ffill().bfill()
         X_np_all, y_np_all = X_df.to_numpy(dtype=np.float32), y_sr.to_numpy(dtype=np.float32)
         warmup = config['data_bank_sz'] + 1
-        train_sz = config['train_sz'] + warmup
+        train_sz = int(train_sz_cfg) + warmup
         orig = y_sr; mask = ~orig.isna().to_numpy()
         mu, sigma = np.nanmean(X_np_all[:train_sz], axis=0), np.nanstd(X_np_all[:train_sz], axis=0)
         sigma[sigma == 0] = 1.0
@@ -422,47 +564,58 @@ def main():
         plot_predictions(model, test_X,  test_y,  config['target'], "Test",  "plots/test_true_vs_pred.png")
 
     elif config['forecast_type'] == 'lstm':
-        # —— binarize labels
-        t2 = np.percentile(data[config['target']], 95)
-        print(f"Bloom threshold is {t2}")
-        bins = torch.tensor([t2], dtype=torch.float32)
-        y = torch.bucketize(y, bins)  # 0/1
+        # ---- build 0/1 labels with TRAIN-ONLY threshold (no leakage) ----
+        Val_carve_sz = int(config.get("val_len", 100))
+        train_sz_adj = train_sz - Val_carve_sz
+        assert train_sz_adj > 0, "train_sz must exceed val_len."
 
-        Val_carve_sz = 126
-        train_sz = train_sz - Val_carve_sz
-        train_X, train_y = X[:train_sz], y[:train_sz]
-        val_X,   val_y   = X[train_sz:train_sz+Val_carve_sz], y[train_sz:train_sz+Val_carve_sz]
-        test_X,  test_y  = X[train_sz+Val_carve_sz:],         y[train_sz+Val_carve_sz:]
+        # percentile on TRAIN ONLY
+        t2 = float(np.percentile(y[:train_sz_adj].detach().cpu().numpy(), 95))
+        print(f"[Labels] Train-only 95th percentile threshold = {t2:.2f}")
+        bins = torch.tensor([t2], dtype=torch.float32)  # for 2 classes
+        y = torch.bucketize(y, bins)
 
-        seq_len = config['seq_len']
+        # ---- split into train/val/test ----
+        train_X, train_y = X[:train_sz_adj], y[:train_sz_adj]
+        val_X,   val_y   = X[train_sz_adj:train_sz_adj + Val_carve_sz], y[train_sz_adj:train_sz_adj + Val_carve_sz]
+        test_X,  test_y  = X[train_sz_adj + Val_carve_sz:], y[train_sz_adj + Val_carve_sz:]
 
-        # —— Build TRAIN windows + augmented noisy subset
-        train_mask = mask[:train_sz]
+        seq_len = config['seq_len']  # window length
+
+        # 1) Segment-by-segment windowing to respect gaps
+        train_mask = mask[:train_sz_adj]
         good = np.where(train_mask)[0]
         breaks = np.where(np.diff(good) != 1)[0] + 1
         segments = np.split(good, breaks)
 
         vanilla_subs, noisy_subs = [], []
-        maj_frac, noise_pct = config['noisy_prop'], config['noise_pct']
+        maj_frac = config['noisy_prop']
+        noise_pct = config['noise_pct']
 
         for seg in segments:
-            if len(seg) <= seq_len: continue
-            Xi, yi = X[seg], y[seg]
+            if len(seg) <= seq_len:
+                continue
+            Xi = X[seg]; yi = y[seg]
             vanilla_subs.append(SequenceDataset(Xi, yi, seq_len))
+
             base_idxs = list(range(len(Xi) - seq_len))
-            minority = [i for i in base_idxs if yi[i + seq_len] == 1]
-            majority = [i for i in base_idxs if yi[i + seq_len] == 0]
-            kmaj = int(len(majority) * maj_frac)
-            selected = minority + random.sample(majority, k=kmaj)
-            noisy_subs.append(NoisySequenceDataset(Xi, yi, seq_len=seq_len, noise_pct=noise_pct, indices=selected))
+            minority_idxs = [i for i in base_idxs if yi[i + seq_len] == 1]
+            majority_idxs = [i for i in base_idxs if yi[i + seq_len] == 0]
+            num_maj_to_sample = int(len(majority_idxs) * maj_frac)
+            maj_sampled = random.sample(majority_idxs, k=max(0, num_maj_to_sample))
+            selected_idxs = minority_idxs + maj_sampled
+
+            noisy_subs.append(
+                NoisySequenceDataset(Xi, yi, seq_len=seq_len, noise_pct=noise_pct, indices=selected_idxs)
+            )
 
         augmented_ds = ConcatDataset(vanilla_subs + noisy_subs)
+
         batch_sz = config['batch_sz']
         GAP, VAL_LEN = config['seq_len'], Val_carve_sz
-        train_end = train_sz
 
         # —— VAL windows
-        val_start, val_end = train_end + GAP, train_end + GAP + VAL_LEN
+        val_start, val_end = train_sz_adj + GAP, train_sz_adj + GAP + VAL_LEN
         mask_val = mask[val_start:val_end]
         good_val = np.where(mask_val)[0]
         cuts = np.where(np.diff(good_val) != 1)[0] + 1
@@ -499,17 +652,20 @@ def main():
                                                          replacement=True)
         train_loader = DataLoader(augmented_ds, batch_size=batch_sz, sampler=sampler)
 
-        # =================== AUC-based gate init (choose via config) ===================
-        # Required config keys with defaults if missing:
-        gate_mode   = str(config.get('gate_init_mode', 'topk'))  # 'topk' or 'continuous'
-        gate_hi     = float(config.get('gate_hi', 0.98))
-        gate_lo     = float(config.get('gate_lo', 0.02))
-        gate_top_k  = int(config.get('gate_top_k', min(100, config['n'])))
-        gate_sharp  = float(config.get('gate_sharp', 6.0))
-        gate_temp   = float(config.get('gate_temperature', 8.0))
-        freeze_g    = int(config.get('gate_freeze_epochs', 0))
+        count_windows(augmented_ds, "TRAIN (aug)")
+        count_windows(val_ds, "VAL")
+        count_windows(test_ds, "TEST")
 
-        X_flat, y_flat = X[:train_sz], y[:train_sz]
+        # =================== AUC-based gate init (choose via config) ===================
+        gate_mode   = str(config.get('gate_init_mode', 'continuous'))  # default to 'continuous'
+        gate_hi     = float(config.get('gate_hi', 0.8))
+        gate_lo     = float(config.get('gate_lo', 0.2))
+        gate_top_k  = int(config.get('gate_top_k', min(100, config['n'])))
+        gate_sharp  = float(config.get('gate_sharp', 3.0))
+        gate_temp   = float(config.get('gate_temperature', 6.0))  # softer by default
+        freeze_g    = int(config.get('gate_freeze_epochs', 10))
+
+        X_flat, y_flat = X[:train_sz_adj], y[:train_sz_adj]
         if gate_mode.lower().startswith('cont'):
             init_probs, _ = init_probs_auc_continuous(X_flat, y_flat, lo=gate_lo, hi=gate_hi,
                                                       center=0.5, sharp=gate_sharp)
@@ -530,6 +686,14 @@ def main():
             gate_temperature=gate_temp
         ).to(device)
 
+        # Prior-logit bias to match train prevalence
+        with torch.no_grad():
+            p = float((train_y == 1).float().mean().clamp(1e-6, 1-1e-6))
+            last = model.core.classifier[-1]
+            if isinstance(last, nn.Linear) and last.out_features == 2:
+                b = math.log(p/(1-p))
+                last.bias[1].fill_(b); last.bias[0].fill_(-b)
+
         # —— Loss with class weighting for imbalance
         weights = torch.tensor([1.0, config['bloom_pen']], device=device)
         loss_func = nn.CrossEntropyLoss(weight=weights)
@@ -543,9 +707,10 @@ def main():
             gate_reg_l1=1e-4, gate_reg_bin=1e-4, freeze_gate_epochs=freeze_g
         )
 
-        # —— Save best, threshold, confusion matrices, ROC
+        # —— Save best, threshold, confusion matrices, ROC (using EMA-best already loaded)
         save_path = config["save_path"]; os.makedirs(os.path.dirname(save_path), exist_ok=True)
         torch.save(model.state_dict(), save_path)
+
         thr, _ = best_threshold_from_roc(model, val_loader, device=device, method="youden")
         print(f"The threshold is {thr}"); print(f"Model weights saved to {save_path}")
 
