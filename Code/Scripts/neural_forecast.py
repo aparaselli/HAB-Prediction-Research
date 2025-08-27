@@ -1,4 +1,4 @@
-from forecast import *  # load_yaml, clean_data, process_parameters, create_model, ...
+from forecast import *  # load_yaml, clean_data, process_parameters, create_model, plot_predictions
 import argparse, random, os, math
 import numpy as np
 import pandas as pd
@@ -485,6 +485,39 @@ def train_model(
     return model, final_test_auc
 
 
+# ========================= Mixing helpers (VAL/TEST) =========================
+
+class _IndexedSlice(Dataset):
+    """Picks specific window indices (s_i, k) from a list of SequenceDatasets."""
+    def __init__(self, subs, picks):
+        self.subs = subs; self.picks = picks
+    def __len__(self): return len(self.picks)
+    def __getitem__(self, i):
+        s_i, k = self.picks[i]
+        return self.subs[s_i][k]
+
+def _windows_from_runs(runs, offset, X, y, seq_len):
+    subs = []
+    for r in runs:
+        if len(r) > seq_len:
+            idx = r + offset
+            subs.append(SequenceDataset(X[idx], y[idx], seq_len))
+    return subs
+
+def _post_train_runs(mask, start, end, seq_len):
+    mask_seg = mask[start:end]
+    good = np.where(mask_seg)[0]
+    cuts = np.where(np.diff(good) != 1)[0] + 1
+    return [r for r in np.split(good, cuts) if len(r) > seq_len]
+
+def _enumerate_windows(subs):
+    picks = []
+    for s_i, sub in enumerate(subs):
+        L = len(sub)
+        for k in range(L):
+            picks.append((s_i, k))
+    return picks
+
 # ================================== Main ====================================
 
 def main():
@@ -575,14 +608,12 @@ def main():
         bins = torch.tensor([t2], dtype=torch.float32)  # for 2 classes
         y = torch.bucketize(y, bins)
 
-        # ---- split into train/val/test ----
+        # ---- split into train/val/test base tensors ----
         train_X, train_y = X[:train_sz_adj], y[:train_sz_adj]
-        val_X,   val_y   = X[train_sz_adj:train_sz_adj + Val_carve_sz], y[train_sz_adj:train_sz_adj + Val_carve_sz]
-        test_X,  test_y  = X[train_sz_adj + Val_carve_sz:], y[train_sz_adj + Val_carve_sz:]
 
         seq_len = config['seq_len']  # window length
 
-        # 1) Segment-by-segment windowing to respect gaps
+        # 1) Segment-by-segment windowing to respect gaps (TRAIN)
         train_mask = mask[:train_sz_adj]
         good = np.where(train_mask)[0]
         breaks = np.where(np.diff(good) != 1)[0] + 1
@@ -612,37 +643,7 @@ def main():
         augmented_ds = ConcatDataset(vanilla_subs + noisy_subs)
 
         batch_sz = config['batch_sz']
-        GAP, VAL_LEN = config['seq_len'], Val_carve_sz
-
-        # —— VAL windows
-        val_start, val_end = train_sz_adj + GAP, train_sz_adj + GAP + VAL_LEN
-        mask_val = mask[val_start:val_end]
-        good_val = np.where(mask_val)[0]
-        cuts = np.where(np.diff(good_val) != 1)[0] + 1
-        runs = [r for r in np.split(good_val, cuts) if len(r) > seq_len]
-        val_subs = []
-        for r in runs:
-            idx = r + val_start
-            val_subs.append(SequenceDataset(X[idx], y[idx], seq_len))
-        val_ds = ConcatDataset(val_subs)
-
-        # —— TEST windows
-        test_start, test_end = val_end, len(X)
-        mask_test = mask[test_start:test_end]
-        good_test = np.where(mask_test)[0]
-        cuts = np.where(np.diff(good_test) != 1)[0] + 1
-        runs = [r for r in np.split(good_test, cuts) if len(r) > seq_len]
-        test_subs = []
-        for r in runs:
-            idx = r + test_start
-            test_subs.append(SequenceDataset(X[idx], y[idx], seq_len))
-        test_ds = ConcatDataset(test_subs)
-
-        # —— Loaders
-        val_loader  = DataLoader(val_ds,  batch_size=batch_sz, shuffle=False)
-        test_loader = DataLoader(test_ds, batch_size=batch_sz, shuffle=False)
-
-        # —— Weighted sampling on augmented train
+        # —— TRAIN loader (weighted sampling on augmented)
         labels_aug = torch.tensor([int(augmented_ds[i][1]) for i in range(len(augmented_ds))])
         class_counts   = torch.bincount(labels_aug, minlength=2).float()
         class_weights  = 1.0 / class_counts
@@ -652,12 +653,70 @@ def main():
                                                          replacement=True)
         train_loader = DataLoader(augmented_ds, batch_size=batch_sz, sampler=sampler)
 
+        # ========================= VAL/TEST MIXING =========================
+        mix_mode   = str(config.get("val_test_mix_mode", "block")).lower()     # "block" | "interleave" | "random"
+        val_ratio  = float(config.get("val_mix_ratio", 0.4))                   # only for "random"
+        mix_seed   = int(config.get("mix_seed", 1337))
+
+        GAP, VAL_LEN = config['seq_len'], Val_carve_sz
+        val_start, val_end = train_sz_adj + GAP, train_sz_adj + GAP + VAL_LEN
+        test_start, test_end = val_end, len(X)
+
+        if mix_mode == "block":
+            # —— Original contiguous VAL, contiguous TEST
+            # VAL windows
+            mask_val = mask[val_start:val_end]
+            good_val = np.where(mask_val)[0]
+            cuts = np.where(np.diff(good_val) != 1)[0] + 1
+            runs = [r for r in np.split(good_val, cuts) if len(r) > seq_len]
+            val_subs = [SequenceDataset(X[r + val_start], y[r + val_start], seq_len) for r in runs]
+            val_ds = ConcatDataset(val_subs)
+
+            # TEST windows
+            mask_test = mask[test_start:test_end]
+            good_test = np.where(mask_test)[0]
+            cuts = np.where(np.diff(good_test) != 1)[0] + 1
+            runs = [r for r in np.split(good_test, cuts) if len(r) > seq_len]
+            test_subs = [SequenceDataset(X[r + test_start], y[r + test_start], seq_len) for r in runs]
+            test_ds = ConcatDataset(test_subs)
+
+        else:
+            # Build all post-train windows, then split by interleave or random
+            post_start = val_start
+            post_end   = len(X)
+            runs_post  = _post_train_runs(mask, post_start, post_end, seq_len)
+            all_subs   = _windows_from_runs(runs_post, post_start, X, y, seq_len)
+            all_picks  = _enumerate_windows(all_subs)
+
+            if mix_mode == "interleave":
+                val_picks, test_picks = [], []
+                toggle = 0
+                for pick in all_picks:
+                    if toggle == 0: val_picks.append(pick)
+                    else:           test_picks.append(pick)
+                    toggle ^= 1
+            elif mix_mode == "random":
+                rs = np.random.RandomState(mix_seed)
+                perm = rs.permutation(len(all_picks))
+                cut  = int(len(perm) * val_ratio)
+                val_picks  = [all_picks[i] for i in perm[:cut]]
+                test_picks = [all_picks[i] for i in perm[cut:]]
+            else:
+                raise ValueError("val_test_mix_mode must be 'block', 'interleave', or 'random'")
+
+            val_ds  = _IndexedSlice(all_subs, val_picks)
+            test_ds = _IndexedSlice(all_subs, test_picks)
+
+        val_loader  = DataLoader(val_ds,  batch_size=batch_sz, shuffle=False)
+        test_loader = DataLoader(test_ds, batch_size=batch_sz, shuffle=False)
+
+        # Debug counts
         count_windows(augmented_ds, "TRAIN (aug)")
         count_windows(val_ds, "VAL")
         count_windows(test_ds, "TEST")
 
         # =================== AUC-based gate init (choose via config) ===================
-        gate_mode   = str(config.get('gate_init_mode', 'continuous'))  # default to 'continuous'
+        gate_mode   = str(config.get('gate_init_mode', 'continuous'))  # 'continuous' or 'topk'
         gate_hi     = float(config.get('gate_hi', 0.8))
         gate_lo     = float(config.get('gate_lo', 0.2))
         gate_top_k  = int(config.get('gate_top_k', min(100, config['n'])))
@@ -707,7 +766,7 @@ def main():
             gate_reg_l1=1e-4, gate_reg_bin=1e-4, freeze_gate_epochs=freeze_g
         )
 
-        # —— Save best, threshold, confusion matrices, ROC (using EMA-best already loaded)
+        # —— Save best, threshold, confusion matrices, ROC (EMA-best already loaded)
         save_path = config["save_path"]; os.makedirs(os.path.dirname(save_path), exist_ok=True)
         torch.save(model.state_dict(), save_path)
 
