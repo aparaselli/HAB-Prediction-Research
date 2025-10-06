@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from copy import deepcopy
 from torch.utils.data import Dataset, TensorDataset, DataLoader, ConcatDataset
+import csv
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
@@ -271,6 +272,8 @@ def train_model(
 
     model.to(device)
 
+    r = (0, 0)
+
     # ---------- EMA as a state_dict buffer (no Module deepcopy) ----------
     @torch.no_grad()
     def _clone_state_dict(sd):
@@ -429,7 +432,10 @@ def train_model(
                     test_auc = roc_auc_score(t_true, t_score)
                 model.load_state_dict(live_state, strict=False)
 
-        if ep % 5 == 0:
+        if auc_val > r[0]:
+            r = (auc_val, test_auc)
+
+        if ep % 10 == 0:
             msg = (f"Epoch {ep:3d}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
                    f"bal_acc={bal_acc:.4f}  val_auc={auc_val:.4f}")
             if test_loader is not None and test_auc is not None:
@@ -448,16 +454,6 @@ def train_model(
             if wait >= patience:
                 print(f"⏹ Early stopping at epoch {ep}")
                 break
-
-    # ---------- Plot losses ----------
-    try:
-        plt.figure(figsize=(6,4))
-        plt.plot(train_losses, label="Train Loss")
-        plt.plot(val_losses,   label="Val Loss")
-        plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.legend(); plt.title("Training & Validation Loss")
-        plt.tight_layout(); plt.show()
-    except Exception:
-        pass  # plotting optional
 
     # ---------- Load best EMA snapshot and compute final TEST AUC ----------
     if best_state is not None:
@@ -482,7 +478,13 @@ def train_model(
     else:
         print("Best model not loaded")
 
-    return model, final_test_auc
+    os.makedirs("../Results", exist_ok=True)
+    plot_roc_with_thresholds(model, val_loader, device=device,
+                             save_path="../Results/ROC_val.png")
+    plot_roc_with_thresholds(model, test_loader, device=device,
+                             save_path="../Results/ROC_test.png")
+
+    return model, final_test_auc, r
 
 
 # ========================= Mixing helpers (VAL/TEST) =========================
@@ -759,10 +761,10 @@ def main():
 
         # —— Train (with optional gate warm-up freeze)
         print('Training model')
-        _, auc_val = train_model(
+        _, auc_val, r = train_model(
             model, train_loader, val_loader,
-            epochs=100000, lr=config['learning_rate'],
-            loss_func=loss_func, device=device, patience=400, test_loader=test_loader,
+            epochs=1000, lr=config['learning_rate'],
+            loss_func=loss_func, device=device, patience=100, test_loader=test_loader,
             gate_reg_l1=1e-4, gate_reg_bin=1e-4, freeze_gate_epochs=freeze_g
         )
 
@@ -773,12 +775,28 @@ def main():
         thr, _ = best_threshold_from_roc(model, val_loader, device=device, method="youden")
         print(f"The threshold is {thr}"); print(f"Model weights saved to {save_path}")
 
-        class_names = ["no bloom", "bloom"]
-        print("=== Train Confusion Matrix ===")
-        _ = eval_confusion(model, train_loader, device, labels=class_names, title="Train: True vs Predicted", threshold=thr)
-        print("=== Test Confusion Matrix ===")
-        _ = eval_confusion(model, test_loader,  device, labels=class_names, title="Test: True vs Predicted",  threshold=thr)
-        print("=== Test ROC ==="); plot_roc_with_thresholds(model, test_loader, device=device, pos_label=1)
+        # class_names = ["no bloom", "bloom"]
+        # print("=== Train Confusion Matrix ===")
+        # _ = eval_confusion(model, train_loader, device, labels=class_names, title="Train: True vs Predicted", threshold=thr)
+        # print("=== Test Confusion Matrix ===")
+        # _ = eval_confusion(model, test_loader,  device, labels=class_names, title="Test: True vs Predicted",  threshold=thr)
+        # print("=== Test ROC ==="); plot_roc_with_thresholds(model, test_loader, device=device, pos_label=1)
 
-if __name__ == "__main__":
-    main()
+        print(r)
+        return r
+
+
+results = []
+for run in range(1, 101):  # 100 runs
+    print(f"\n===== Run {run} =====")
+    val_auc, test_auc = main()  # run training once
+    results.append((run, val_auc, test_auc))
+
+# Save to CSV
+out_path = "val_test_results.csv"
+with open(out_path, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["run", "best_val_auc", "test_auc_at_best_val"])
+    writer.writerows(results)
+
+print(f"\n✅ Saved results to {out_path}")
