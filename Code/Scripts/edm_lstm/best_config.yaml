@@ -1,27 +1,23 @@
 model:
-  architecture: HybridTABWithGate  
-  input_dim: 752       
-  layers: 2
-  tcn_channels: [64, 64]
-  mha_heads: 4
+  architecture: HybridTABWithGate
   dropout: 0.5
   gate_temperature: 6.0
-
+  hidden: 256
+  input_dim: 752
+  layers: 2
+  mha_heads: 4
+  tcn_channels:
+  - 128
+  - 128
+results:
+  test_auc: 0.7971
+  val_auc: 0.7236
 training:
-  lr: 0.0003
   batch_sz: 12
   bloom_pen: 2.0
-  weight_decay: 0.0001
-  epochs: 1500
-  patience: 120
   ema_decay: 0.995
-  seed: 41
-
-augmentation:
-  noisy_prop: 0.5
-  noise_pct: 0.03
-
-gate:
-  gate_reg_l1: 0.0001
-  gate_reg_bin: 0.0001
-  freeze_gate_epochs: 10
+  epochs: 1200
+  lr: 0.0002
+  patience: 100
+  seed: 58
+  weight_decay: 0.0001

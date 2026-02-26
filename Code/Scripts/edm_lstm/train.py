@@ -326,15 +326,17 @@ def train_one(data_info, hp, device, seed):
 # ========================= Main =========================
 
 if __name__ == "__main__":
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configs", "lstm_carter_script.yaml")
+    import time, yaml as _yaml
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, "..", "configs", "lstm_carter_script.yaml")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
     data_info = prepare_data(config_path)
 
-    # Configs to try — bigger hidden sizes only
+    # Configs to sweep
     configs = {
-        # hidden=64, tcn=64
         'h64_t64': {
             'hidden': 64, 'layers': 2, 'tcn_ch': 64, 'mha_heads': 4,
             'dropout': 0.5, 'lr': 0.0003, 'batch_sz': 12, 'bloom_pen': 2.0,
@@ -343,7 +345,6 @@ if __name__ == "__main__":
             'ema_decay': 0.995, 'gate_temp': 6.0,
             'gate_reg_l1': 1e-4, 'gate_reg_bin': 1e-4, 'freeze_gate_epochs': 10,
         },
-        # hidden=128, tcn=128
         'h128_t128': {
             'hidden': 128, 'layers': 2, 'tcn_ch': 128, 'mha_heads': 4,
             'dropout': 0.5, 'lr': 0.0003, 'batch_sz': 12, 'bloom_pen': 2.0,
@@ -352,7 +353,6 @@ if __name__ == "__main__":
             'ema_decay': 0.995, 'gate_temp': 6.0,
             'gate_reg_l1': 1e-4, 'gate_reg_bin': 1e-4, 'freeze_gate_epochs': 10,
         },
-        # hidden=64, tcn=64, original lr + dropout
         'h64_orig_lr': {
             'hidden': 64, 'layers': 2, 'tcn_ch': 64, 'mha_heads': 4,
             'dropout': 0.8, 'lr': 0.0001, 'batch_sz': 16, 'bloom_pen': 1.5,
@@ -361,7 +361,6 @@ if __name__ == "__main__":
             'ema_decay': 0.995, 'gate_temp': 6.0,
             'gate_reg_l1': 1e-4, 'gate_reg_bin': 1e-4, 'freeze_gate_epochs': 10,
         },
-        # hidden=128, tcn=64, lower dropout
         'h128_t64_ld': {
             'hidden': 128, 'layers': 2, 'tcn_ch': 64, 'mha_heads': 4,
             'dropout': 0.3, 'lr': 0.0003, 'batch_sz': 12, 'bloom_pen': 2.0,
@@ -370,7 +369,6 @@ if __name__ == "__main__":
             'ema_decay': 0.995, 'gate_temp': 6.0,
             'gate_reg_l1': 1e-4, 'gate_reg_bin': 1e-4, 'freeze_gate_epochs': 10,
         },
-        # hidden=256, tcn=128 — big
         'h256_t128': {
             'hidden': 256, 'layers': 2, 'tcn_ch': 128, 'mha_heads': 4,
             'dropout': 0.5, 'lr': 0.0002, 'batch_sz': 12, 'bloom_pen': 2.0,
@@ -381,20 +379,24 @@ if __name__ == "__main__":
         },
     }
 
-    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Results")
+    save_dir = os.path.join(script_dir, "..", "..", "Results")
     os.makedirs(save_dir, exist_ok=True)
-    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hybrid_blast_results.csv")
 
-    with open(out_path, "w", newline="") as f:
-        csv.writer(f).writerow(["config", "seed", "test_auc", "val_auc"])
+    # Progress log — CSV with every run, append-safe so you can check anytime
+    log_path = os.path.join(script_dir, "sweep_log.csv")
+    with open(log_path, "w", newline="") as f:
+        csv.writer(f).writerow(["run", "config", "seed", "val_auc", "test_auc",
+                                 "best_val_so_far", "best_test_at_best_val", "elapsed_min"])
 
     best_val_overall = 0.0
     best_test_at_best_val = 0.0
     best_info = ""
+    best_model_state = None
     SEEDS_PER_CFG = 40
 
     total = len(configs) * SEEDS_PER_CFG
     run_i = 0
+    t0 = time.time()
 
     for cfg_name, hp in configs.items():
         print(f"\n{'='*60}")
@@ -407,31 +409,58 @@ if __name__ == "__main__":
             print(f"[{run_i}/{total}] {cfg_name} seed={seed} ...", end=" ", flush=True)
 
             test_auc, val_auc, model = train_one(data_info, hp, device, seed)
-            print(f"val={val_auc:.4f} test={test_auc:.4f}", end="")
-
-            with open(out_path, "a", newline="") as f:
-                csv.writer(f).writerow([cfg_name, seed, f"{test_auc:.4f}", f"{val_auc:.4f}"])
+            elapsed = (time.time() - t0) / 60.0
+            print(f"val={val_auc:.4f} test={test_auc:.4f} ({elapsed:.1f}min)", end="")
 
             # Track best by VAL AUC (honest selection)
             if val_auc > best_val_overall:
                 best_val_overall = val_auc
                 best_test_at_best_val = test_auc
                 best_info = f"{cfg_name}/seed={seed}"
+                best_model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                torch.save(model.state_dict(), os.path.join(script_dir, "best_model.pth"))
                 torch.save(model.state_dict(), os.path.join(save_dir, "edm_lstm_sweep_best.pth"))
                 print(f"  *** NEW BEST VAL: {best_val_overall:.4f} (test={test_auc:.4f}) ***", end="")
 
-            # Also save if test AUC >= 0.78 (for convenience)
+            # Also save if test AUC >= 0.78
             if test_auc >= 0.78:
-                winner_path = os.path.join(save_dir, "edm_lstm_078plus.pth")
-                torch.save(model.state_dict(), winner_path)
-                print(f"\n\n{'='*60}")
-                print(f"  0.78+ HIT! {cfg_name} seed={seed} val={val_auc:.4f} test={test_auc:.4f}")
-                print(f"  Saved to {winner_path}")
-                print(f"{'='*60}")
+                torch.save(model.state_dict(), os.path.join(save_dir, "edm_lstm_078plus.pth"))
+                print(f" [0.78+ HIT]", end="")
+
+            # Log to CSV (append after every seed — safe to read mid-run)
+            with open(log_path, "a", newline="") as f:
+                csv.writer(f).writerow([run_i, cfg_name, seed,
+                                        f"{val_auc:.4f}", f"{test_auc:.4f}",
+                                        f"{best_val_overall:.4f}", f"{best_test_at_best_val:.4f}",
+                                        f"{elapsed:.1f}"])
 
             print(flush=True)
 
+    # ---- Final summary ----
+    total_min = (time.time() - t0) / 60.0
     print(f"\n{'='*60}")
-    print(f"DONE — Best val: {best_val_overall:.4f} (test={best_test_at_best_val:.4f}) ({best_info})")
-    print(f"Results: {out_path}")
+    print(f"DONE in {total_min:.1f} min")
+    print(f"Best val: {best_val_overall:.4f} (test={best_test_at_best_val:.4f})")
+    print(f"Config: {best_info}")
+    print(f"Progress log: {log_path}")
+    print(f"Best model: {os.path.join(script_dir, 'best_model.pth')}")
     print(f"{'='*60}")
+
+    # Save best_config.yaml with winning hyperparams
+    cfg_name_best = best_info.split("/")[0]
+    seed_best = int(best_info.split("seed=")[1])
+    hp_best = configs[cfg_name_best]
+    with open(os.path.join(script_dir, "best_config.yaml"), "w") as f:
+        _yaml.dump({
+            "model": {"architecture": "HybridTABWithGate", "input_dim": 752,
+                       "hidden": hp_best["hidden"], "layers": hp_best["layers"],
+                       "tcn_channels": [hp_best["tcn_ch"], hp_best["tcn_ch"]],
+                       "mha_heads": hp_best["mha_heads"], "dropout": hp_best["dropout"],
+                       "gate_temperature": hp_best.get("gate_temp", 6.0)},
+            "training": {"lr": hp_best["lr"], "batch_sz": hp_best["batch_sz"],
+                          "bloom_pen": hp_best["bloom_pen"], "weight_decay": hp_best["weight_decay"],
+                          "epochs": hp_best["epochs"], "patience": hp_best["patience"],
+                          "ema_decay": hp_best.get("ema_decay", 0.995), "seed": seed_best},
+            "results": {"val_auc": round(best_val_overall, 4),
+                         "test_auc": round(best_test_at_best_val, 4)},
+        }, f, default_flow_style=False)
